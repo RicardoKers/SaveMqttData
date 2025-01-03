@@ -1,0 +1,13 @@
+{
+    "broker": "test.mosquitto.org",
+	"port": 1883,
+	"username": "",
+	"password": "",
+	"client_id": "mqtt_client",
+	"topics": ["/my/temperature/", "/my/humidity/"],
+	"sampling_interval": [60, 120],
+	"retention_days": [2, 2],
+	"websocket_port": 8080,
+	"API_Rest_port": 8081,
+	"passkeyHash": "$argon2id$v=19$m=65536,t=3,p=4$..."
+}
