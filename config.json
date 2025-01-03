@@ -1,5 +1,5 @@
 {
-    "broker": "test.mosquitto.org",
+	"broker": "test.mosquitto.org",
 	"port": 1883,
 	"username": "",
 	"password": "",
