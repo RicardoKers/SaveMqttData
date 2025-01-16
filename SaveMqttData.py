@@ -1,9 +1,4 @@
-# SaveMqttData Version 0.9.2
-#
-# This program collects messages from specified MQTT topics, stores them per topic
-# in JSON files, applies data retention policies, and optionally provides both a
-# WebSocket and a REST API to query the collected data. It also uses Argon2-based
-# hashing to protect passkeys for client authentication.
+# SaveMqttData Version 0.9.6
 
 import json
 import paho.mqtt.client as mqtt
@@ -15,40 +10,34 @@ from websockets import serve, exceptions as ws_exceptions
 import logging
 import os
 import psutil
-from argon2 import PasswordHasher, exceptions as argon2_exceptions  # Argon2 for password (hash) verification
-from aiohttp import web  # AIOHTTP for the REST server
+import sys
+from argon2 import PasswordHasher, exceptions as argon2_exceptions
+from aiohttp import web
 
-# Program version constant
-VERSION = "0.9.2"
+VERSION = "0.9.6"
 
-# Configure Python logging (only changes log messages, not the logic)
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# Global locks:
-#   file_lock - ensures exclusive file access (reading/writing JSON)
-#   userdata_lock - protects shared dictionaries (e.g. last_values) in memory
 file_lock = Lock()
 userdata_lock = Lock()
 
-# Used to calculate system uptime (time since the program started)
 start_time_utc = datetime.now(timezone.utc)
-
-# Counts how many MQTT messages have been received
 packets_count = 0
 
-# Global reference to the userdata dictionary for WebSocket usage,
-# because websockets.ServerConnection objects do not hold an 'app' attribute
 GLOBAL_USERDATA = None
+
+# ---------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ---------------------------------------------------------------------------
 
 def load_config(file_path):
     """
-    Loads JSON configuration from a specified file path.
-    Returns a dict on success, or None if the file is missing/invalid.
+    Loads JSON config from 'file_path'. Returns dict or None if missing/invalid.
     """
     try:
-        with open(file_path, 'r') as file:
-            return json.load(file)
+        with open(file_path, 'r') as f:
+            return json.load(f)
     except FileNotFoundError:
         log.error(f"Config file '{file_path}' not found.")
         return None
@@ -58,137 +47,203 @@ def load_config(file_path):
 
 def get_topic_file_name(topic):
     """
-    Returns a filename to store data for a given MQTT topic,
-    by replacing slashes ('/') with dashes ('-'). For example:
-    '/my/temperature/' -> 'Data_-my-temperature-.json'
+    Converts slashes ('/') into dashes ('-') to build a disk filename for 'topic'.
+    Example: '/my/temperature/' -> 'Data_-my-temperature-.json'
     """
     return "Data_" + topic.replace("/", "-") + ".json"
 
-def save_data(_unused_file_path, data, retention_days):
-    """
-    Saves incoming data (a dictionary {topic: value}) into per-topic JSON files.
-    Applies a retention policy based on 'retention_days' to remove older records.
-
-    _unused_file_path: unused parameter to maintain compatibility with older code.
-    data: dict mapping MQTT topic -> the new value to store
-    retention_days: number of days to keep data
-    """
-    try:
-        with file_lock:
-            for topic, value in data.items():
-                topic_file = get_topic_file_name(topic)
-                try:
-                    with open(topic_file, 'r') as f:
-                        try:
-                            file_data = json.load(f)
-                        except json.JSONDecodeError:
-                            file_data = []
-                except FileNotFoundError:
-                    file_data = []
-
-                # Remove entries older than the retention period
-                cutoff_time = datetime.now(timezone.utc) - timedelta(days=retention_days)
-                def in_range(entry):
-                    entry_time = datetime.fromisoformat(entry["T"]).astimezone(timezone.utc)
-                    return entry_time >= cutoff_time
-
-                file_data = [entry for entry in file_data if in_range(entry)]
-
-                # Append the new record with the current timestamp
-                timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                file_data.append({"T": timestamp, "V": value})
-
-                # Write the updated data back to the JSON file
-                with open(topic_file, 'w') as f:
-                    json.dump(file_data, f, indent=4)
-
-                log.info(f"Data saved to {topic_file}.")
-    except Exception:
-        log.exception("Unhandled exception while saving data.")
-
 def passkey_valid(passkey):
     """
-    Validates the provided 'passkey' by comparing it with the Argon2 hash
-    stored in 'config.json'. Returns True if valid, False otherwise.
+    Validates 'passkey' using Argon2 hash from config.json.
+    Returns True if correct, False otherwise.
     """
-    config = load_config("config.json")
-    if not config:
+    cfg = load_config("config.json")
+    if not cfg:
         return False
-
-    passkey_hash = config.get("passkeyHash", "")
-    if not passkey or not passkey_hash:
+    stored_hash = cfg.get("passkeyHash", "")
+    if not passkey or not stored_hash:
         return False
-
     ph = PasswordHasher()
     try:
-        ph.verify(passkey_hash, passkey)
+        ph.verify(stored_hash, passkey)
         return True
     except (argon2_exceptions.VerifyMismatchError, argon2_exceptions.VerificationError):
         return False
     except Exception:
         return False
 
+def sys_deep_size(obj, seen=None):
+    """
+    Recursively computes approximate memory usage of 'obj' in bytes.
+    Used in 'health' calls to measure in-memory usage of each topic's data.
+    """
+    if seen is None:
+        seen = set()
+
+    o_id = id(obj)
+    if o_id in seen:
+        return 0
+    seen.add(o_id)
+
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            size += sys_deep_size(k, seen)
+            size += sys_deep_size(v, seen)
+    elif isinstance(obj, (list, tuple, set)):
+        for item in obj:
+            size += sys_deep_size(item, seen)
+    return size
+
+def apply_retention(data_list, retention_days):
+    """
+    Removes records older than 'retention_days' from 'data_list' based on T field.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    def fresh(rec):
+        try:
+            rt = datetime.fromisoformat(rec["T"]).astimezone(timezone.utc)
+            return rt >= cutoff
+        except:
+            return False
+    return [r for r in data_list if fresh(r)]
+
+def filter_data_by_time(data_list, start_dt, end_dt):
+    """
+    Filters data_list (list of { "T": <iso8601>, "V": <val> }) by optional start_dt, end_dt.
+    Returns only records in [start_dt, end_dt].
+    If both are None => returns entire list.
+    """
+    if not start_dt and not end_dt:
+        return data_list
+
+    results = []
+    for r in data_list:
+        try:
+            rt = datetime.fromisoformat(r["T"]).astimezone(timezone.utc)
+            if start_dt and not end_dt:
+                if rt >= start_dt:
+                    results.append(r)
+            elif end_dt and not start_dt:
+                if rt <= end_dt:
+                    results.append(r)
+            else:
+                if start_dt <= rt <= end_dt:
+                    results.append(r)
+        except:
+            pass
+    return results
+
+# ---------------------------------------------------------------------------
+# DISK OPERATIONS
+# ---------------------------------------------------------------------------
+
+def overwrite_disk(topic, new_list):
+    """
+    Overwrites the file for 'topic' with 'new_list'. We assume 'new_list'
+    is already retention-applied and sorted. This ensures memory == disk.
+    """
+    tfile = get_topic_file_name(topic)
+    try:
+        with file_lock:
+            with open(tfile, 'w') as f:
+                json.dump(new_list, f, indent=4)
+            log.info(f"[overwrite_disk] Wrote {len(new_list)} records to {tfile} for topic='{topic}'.")
+    except Exception:
+        log.exception(f"Error overwriting disk for topic='{topic}'")
+
+def load_disk(topic):
+    """
+    Loads entire list of records from disk for 'topic'. Returns a list
+    or empty if not found/invalid.
+    """
+    tfile = get_topic_file_name(topic)
+    if not os.path.exists(tfile):
+        return []
+    try:
+        with file_lock:
+            with open(tfile, 'r') as f:
+                try:
+                    data_list = json.load(f)
+                    if not isinstance(data_list, list):
+                        data_list = []
+                    return data_list
+                except:
+                    return []
+    except:
+        log.exception(f"Error loading data for topic='{topic}' from disk.")
+        return []
+
+# ---------------------------------------------------------------------------
+# GET TOPIC INFO
+# ---------------------------------------------------------------------------
+
 def get_topic_info(topics, topic_settings):
     """
-    Gathers and returns detailed information about each topic in 'topics':
-      - name: the topic string
-      - oldest/newest_timestamp: the first and last saved data record
-      - total_samples: how many records are stored
-      - sampling_interval: time in seconds for downsampling
-      - retention_days: how long data is kept
-      - file_size_bytes: size of the per-topic JSON file on disk
+    Returns an array describing each topic:
+      - name
+      - oldest_timestamp / newest_timestamp
+      - total_samples
+      - sampling_interval, retention_days
+      - file_size_bytes
+      - memory_usage_bytes (if caching is true)
     """
-    info_list = []
+    results = []
     for t in topics:
-        topic_file = get_topic_file_name(t)
-        setting = topic_settings[t]
-        si = setting["sampling_interval"]
-        rd = setting["retention_days"]
+        stt = topic_settings[t]
+        si = stt["sampling_interval"]
+        rd = stt["retention_days"]
+        c_en = stt.get("enable_in_memory_cache", False)
 
-        oldest_timestamp = None
-        newest_timestamp = None
-        total_samples = 0
-        file_size = 0
+        tfile = get_topic_file_name(t)
+        oldest = None
+        newest = None
+        total = 0
+        file_sz = 0
 
-        # Protect file reading with file_lock
         with file_lock:
-            if os.path.exists(topic_file):
-                file_size = os.path.getsize(topic_file)
+            if os.path.exists(tfile):
+                file_sz = os.path.getsize(tfile)
                 try:
-                    with open(topic_file, 'r') as f:
-                        data_list = json.load(f)
-                except (json.JSONDecodeError, FileNotFoundError):
-                    data_list = []
+                    with open(tfile, 'r') as f:
+                        disk_data = json.load(f)
+                except:
+                    disk_data = []
             else:
-                data_list = []
+                disk_data = []
 
-        if data_list:
-            total_samples = len(data_list)
-            # Sort by the "T" field so we can identify oldest/newest records
-            data_list.sort(key=lambda x: x["T"])
-            oldest_timestamp = data_list[0]["T"]
-            newest_timestamp = data_list[-1]["T"]
+        if disk_data:
+            total = len(disk_data)
+            disk_data.sort(key=lambda x: x["T"])
+            oldest = disk_data[0]["T"]
+            newest = disk_data[-1]["T"]
 
-        info_list.append({
+        mem_usage = 0
+        if c_en:
+            # read from in_memory_data
+            mem_list = GLOBAL_USERDATA["in_memory_data"].get(t, [])
+            mem_usage = sys_deep_size(mem_list)
+
+        results.append({
             "name": t,
-            "oldest_timestamp": oldest_timestamp,
-            "newest_timestamp": newest_timestamp,
-            "total_samples": total_samples,
+            "oldest_timestamp": oldest,
+            "newest_timestamp": newest,
+            "total_samples": total,
             "sampling_interval": si,
             "retention_days": rd,
-            "file_size_bytes": file_size
+            "file_size_bytes": file_sz,
+            "memory_usage_bytes": mem_usage
         })
-    return info_list
+    return results
+
+# ---------------------------------------------------------------------------
+# MQTT CALLBACKS
+# ---------------------------------------------------------------------------
 
 def on_connect(client, userdata, flags, rc):
-    """
-    Callback invoked by paho-mqtt upon connecting to the MQTT broker.
-    If rc == 0, the connection is successful, so we subscribe to each topic.
-    Otherwise, logs the error code.
-    """
     if rc == 0:
         log.info("Connected to MQTT Broker!")
-        for topic in userdata.get("topics", []):
+        for topic in userdata["topics"]:
             client.subscribe(topic)
             log.info(f"Subscribed to topic: {topic}")
     else:
@@ -196,242 +251,264 @@ def on_connect(client, userdata, flags, rc):
 
 def on_message(client, userdata, msg):
     """
-    Callback invoked whenever an MQTT message arrives.
-    - Decodes the payload
-    - Checks sampling_interval for the topic
-      -> if 0, saves immediately
-      -> if >0, stores the value in memory and is later saved by check_intervals
+    For each new MQTT message:
+      - if caching => if sampling_interval=0 => immediate flush
+                      else store in 'latest_cache_value' for that topic
+      - if not caching => if sampling_interval=0 => immediate write
+                         else store in 'last_values'
     """
     global packets_count
     try:
         payload = msg.payload.decode()
         topic = msg.topic
 
-        log.debug(f"Message received on topic {topic}: {payload}")
-
         with userdata_lock:
-            userdata['last_values'][topic] = payload
             packets_count += 1
-
-            if topic not in userdata.get("topics", []):
-                log.warning(f"Topic {topic} not found in config topics.")
+            if topic not in userdata["topics"]:
+                log.warning(f"Topic {topic} not found in config.")
                 return
 
-            topic_settings = userdata.get("topic_settings", {})
-            setting = topic_settings.get(topic, None)
-            if setting is None:
-                log.warning(f"No settings found for topic {topic}.")
-                return
+            stt = userdata["topic_settings"][topic]
+            si = stt["sampling_interval"]
+            rd = stt["retention_days"]
+            c_en = stt.get("enable_in_memory_cache", False)
 
-            si = setting["sampling_interval"]
-            rd = setting["retention_days"]
+            if c_en:
+                # For caching
+                if si == 0:
+                    # immediate => append to memory & flush entire list to disk
+                    mem_list = userdata["in_memory_data"].get(topic, [])
+                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    new_rec = {"T": now_str, "V": payload}
+                    mem_list.append(new_rec)
 
-            # If sampling_interval == 0, save immediately
-            if si == 0:
-                save_data(None, {topic: payload}, rd)
-                log.info(f"Saved data immediately for topic '{topic}' (sampling_interval=0).")
+                    # retention
+                    mem_list = apply_retention(mem_list, rd)
+                    userdata["in_memory_data"][topic] = mem_list
+
+                    # flush entire list to disk
+                    overwrite_disk(topic, mem_list)
+
+                else:
+                    # sampling_interval>0 => store only the last message in a "latest_cache_value"
+                    # we don't append to mem_list now, we do so at interval time
+                    userdata["latest_cache_value"][topic] = payload
+
+            else:
+                # not caching
+                if si == 0:
+                    # immediate
+                    disk_data = load_disk(topic)
+                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    disk_data.append({"T": now_str, "V": payload})
+                    disk_data = apply_retention(disk_data, rd)
+                    overwrite_disk(topic, disk_data)
+                else:
+                    userdata["last_values"][topic] = payload
 
     except Exception:
         log.exception("Unhandled exception in on_message")
 
+# ---------------------------------------------------------------------------
+# PERIODIC CHECK
+# ---------------------------------------------------------------------------
+
 async def check_intervals(userdata):
     """
-    Periodic loop (runs asynchronously) to check if the sampling interval has
-    elapsed for each topic. If so, it saves data from memory to the per-topic file
-    and resets the relevant fields.
+    For each topic with sampling_interval>0, we flush once the time is up:
+      - if caching => we append exactly one record to in_memory_data:
+          the "latest_cache_value" or "--" if none
+        apply retention, overwrite disk with entire in_memory_data
+      - if not caching => we append exactly one record to disk:
+          "last_values" or "--" if none
+    Then set last_saved_time, so next flush is in the next interval.
     """
     while True:
         now = datetime.now(timezone.utc)
         with userdata_lock:
-            for t in userdata.get("topics", []):
-                setting = userdata["topic_settings"].get(t, None)
-                if setting is None:
-                    continue
+            for t in userdata["topics"]:
+                stt = userdata["topic_settings"][t]
+                si = stt["sampling_interval"]
+                rd = stt["retention_days"]
+                c_en = stt.get("enable_in_memory_cache", False)
 
-                si = setting["sampling_interval"]
-                rd = setting["retention_days"]
                 last_save = userdata["last_saved_time"][t]
+                if si > 0:
+                    elapsed = (now - last_save).total_seconds()
+                    if elapsed >= si:
+                        if c_en:
+                            # read in_memory_data, plus the single "latest_cache_value"
+                            mem_list = userdata["in_memory_data"].get(t, [])
+                            val = userdata["latest_cache_value"].get(t, None)
+                            now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+                            if val is None:
+                                # no message => record "--"
+                                mem_list.append({"T": now_str, "V": "--"})
+                            else:
+                                mem_list.append({"T": now_str, "V": val})
+                            # retention
+                            mem_list = apply_retention(mem_list, rd)
+                            mem_list.sort(key=lambda x: x["T"])
+                            userdata["in_memory_data"][t] = mem_list
+                            userdata["latest_cache_value"][t] = None  # reset
 
-                # If si != 0, we do periodic saving
-                if si != 0:
-                    if (now - last_save).total_seconds() >= si:
-                        value = userdata["last_values"].get(t, "--")
-                        save_data(None, {t: value}, rd)
-                        userdata["last_values"][t] = "--"
+                            # flush entire memory to disk
+                            overwrite_disk(t, mem_list)
+                        else:
+                            # not caching => read last_values
+                            disk_data = load_disk(t)
+                            val = userdata["last_values"].get(t, None)
+                            now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+                            if val is None:
+                                disk_data.append({"T": now_str, "V": "--"})
+                            else:
+                                disk_data.append({"T": now_str, "V": val})
+                            disk_data = apply_retention(disk_data, rd)
+                            disk_data.sort(key=lambda x: x["T"])
+                            overwrite_disk(t, disk_data)
+                            userdata["last_values"][t] = None
+
                         userdata["last_saved_time"][t] = now
-                        log.info(f"Downsampling active: saved data for topic '{t}'.")
+                        log.info(f"[Downsampling] topic '{t}' => wrote 1 record to disk. Next flush in {si} sec.")
 
-        # Sleep 1 second before checking again
         await asyncio.sleep(1)
 
-def filter_data_by_time(data_list, start_dt, end_dt):
-    """
-    Filters data_list (list of records { "T": <iso8601str>, "V": <value> })
-    by optional 'start_dt' and 'end_dt'.
-    - If both are None, returns all records.
-    - If only start_dt is set, returns data from there onward.
-    - If only end_dt is set, returns data up to that time.
-    - If both exist, returns data in [start_dt, end_dt].
-    """
-    if (start_dt is None) and (end_dt is None):
-        return data_list
-
-    if (start_dt is not None) and (end_dt is None):
-        filtered = []
-        for entry in data_list:
-            try:
-                entry_time = datetime.fromisoformat(entry["T"]).astimezone(timezone.utc)
-                if entry_time >= start_dt:
-                    filtered.append(entry)
-            except Exception:
-                pass
-        return filtered
-
-    if (start_dt is None) and (end_dt is not None):
-        filtered = []
-        for entry in data_list:
-            try:
-                entry_time = datetime.fromisoformat(entry["T"]).astimezone(timezone.utc)
-                if entry_time <= end_dt:
-                    filtered.append(entry)
-            except Exception:
-                pass
-        return filtered
-
-    # If both are provided
-    filtered = []
-    for entry in data_list:
-        try:
-            entry_time = datetime.fromisoformat(entry["T"]).astimezone(timezone.utc)
-            if start_dt <= entry_time <= end_dt:
-                filtered.append(entry)
-        except Exception:
-            pass
-    return filtered
+# ---------------------------------------------------------------------------
+# WEBSOCKET
+# ---------------------------------------------------------------------------
 
 async def handle_request(websocket, path=None):
-    """
-    WebSocket server handler. It listens for JSON messages containing:
-      - 'action' (e.g., 'health', 'get_data')
-      - 'passkey' for Argon2-based verification
-      - 'topic', 'start_time', 'end_time' for data queries
-    """
     global packets_count
     try:
-        async for message in websocket:
+        async for raw_msg in websocket:
             try:
-                request = json.loads(message)
-                action = request.get("action")
-                passkey = request.get("passkey")
-                topic = request.get("topic")
-                start_time_str = request.get("start_time")
-                end_time_str = request.get("end_time")
+                req = json.loads(raw_msg)
+                action = req.get("action")
+                passkey = req.get("passkey")
+                topic = req.get("topic")
+                st = req.get("start_time")
+                et = req.get("end_time")
 
-                # Check passkey
                 if not passkey_valid(passkey):
                     await websocket.send(json.dumps({"error": "Invalid passkey"}))
                     continue
 
                 if action == "health":
-                    # Return system info, memory/disk usage, topics_info, etc.
                     file_dir = os.path.dirname(os.path.abspath(__file__)) or '.'
-                    disk_usage = psutil.disk_usage(file_dir)
+                    disk_use = psutil.disk_usage(file_dir)
                     mem = psutil.virtual_memory()
 
                     now_utc = datetime.now(timezone.utc)
                     with userdata_lock:
                         uptime_seconds = (now_utc - start_time_utc).total_seconds()
-                        topics_copy = GLOBAL_USERDATA.get("topics", [])
-                        settings_copy = GLOBAL_USERDATA.get("topic_settings", {})
+                        all_topics = GLOBAL_USERDATA["topics"]
+                        t_sett = GLOBAL_USERDATA["topic_settings"]
+
+                        sum_mem_cache = 0
+                        for tp in all_topics:
+                            if t_sett[tp].get("enable_in_memory_cache", False):
+                                mem_list = GLOBAL_USERDATA["in_memory_data"].get(tp, [])
+                                sum_mem_cache += sys_deep_size(mem_list)
 
                     days, remainder = divmod(uptime_seconds, 86400)
                     hours, remainder = divmod(remainder, 3600)
                     minutes, seconds = divmod(remainder, 60)
-                    uptime_formatted = f"{int(days)}d, {int(hours):02}:{int(minutes):02}:{int(seconds):02}"
+                    up_str = f"{int(days)}d, {int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
-                    config = load_config("config.json") or {}
-                    files_size_sum = 0
-                    for t in config.get("topics", []):
-                        topic_file = get_topic_file_name(t)
-                        if os.path.exists(topic_file):
-                            files_size_sum += os.path.getsize(topic_file)
+                    cfg = load_config("config.json") or {}
+                    disk_sum = 0
+                    for o in cfg.get("topics", []):
+                        tf = get_topic_file_name(o["topic"])
+                        if os.path.exists(tf):
+                            disk_sum += os.path.getsize(tf)
 
-                    topics_info = get_topic_info(topics_copy, settings_copy)
-                    current_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                    t_info = get_topic_info(all_topics, t_sett)
+                    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
                     info = {
                         "status": "ok",
                         "version": VERSION,
-                        "timestamp": current_ts,
+                        "timestamp": now_str,
                         "mem_total_mb": round(mem.total / (1024 * 1024), 2),
                         "mem_used_mb": round(mem.used / (1024 * 1024), 2),
                         "mem_percent": mem.percent,
-                        "disk_total_mb": round(disk_usage.total / (1024 * 1024), 2),
-                        "disk_used_mb": round(disk_usage.used / (1024 * 1024), 2),
-                        "disk_percent": disk_usage.percent,
-                        "data_files_size_bytes": files_size_sum,
+                        "disk_total_mb": round(disk_use.total / (1024 * 1024), 2),
+                        "disk_used_mb": round(disk_use.used / (1024 * 1024), 2),
+                        "disk_percent": disk_use.percent,
+                        "data_files_size_bytes": disk_sum,
                         "packets_count": packets_count,
-                        "uptime": uptime_formatted,
-                        "topics_info": topics_info
+                        "uptime": up_str,
+                        "cache_mem_total_bytes": sum_mem_cache,
+                        "topics_info": t_info
                     }
                     await websocket.send(json.dumps(info))
 
                 elif action == "get_data":
-                    # Handle data retrieval requests, possibly with time filtering
-                    start_dt = None
-                    end_dt = None
+                    sdt = None
+                    edt = None
+                    if st:
+                        sdt = datetime.fromisoformat(st).astimezone(timezone.utc)
+                    if et:
+                        edt = datetime.fromisoformat(et).astimezone(timezone.utc)
 
-                    if start_time_str:
-                        start_dt = datetime.fromisoformat(start_time_str).astimezone(timezone.utc)
-                    if end_time_str:
-                        end_dt = datetime.fromisoformat(end_time_str).astimezone(timezone.utc)
+                    cfg = load_config("config.json") or {}
+                    req_tops = []
+                    if topic:
+                        req_tops = [topic]
+                    else:
+                        for ob in cfg.get("topics", []):
+                            req_tops.append(ob["topic"])
 
-                    config = load_config("config.json") or {}
-                    requested_topics = [topic] if topic else config.get("topics", [])
-
-                    if (start_dt is not None) and (end_dt is not None) and (start_dt > end_dt):
-                        log.warning("start_time > end_time. Returning empty list.")
+                    if sdt and edt and sdt > edt:
+                        log.warning("start_time> end_time => empty list")
                         await websocket.send(json.dumps([]))
                         continue
 
-                    all_entries = []
-                    with file_lock:
-                        for t in requested_topics:
-                            topic_file = get_topic_file_name(t)
-                            if not os.path.exists(topic_file):
-                                continue
-                            try:
-                                with open(topic_file, 'r') as f:
-                                    data_list = json.load(f)
-                            except (json.JSONDecodeError, FileNotFoundError):
-                                data_list = []
+                    results = []
+                    with userdata_lock:
+                        for t in req_tops:
+                            s = GLOBAL_USERDATA["topic_settings"].get(t, {})
+                            c_en = s.get("enable_in_memory_cache", False)
+                            if c_en:
+                                mem_list = GLOBAL_USERDATA["in_memory_data"].get(t, [])
+                                flt = filter_data_by_time(mem_list, sdt, edt)
+                                for rec in flt:
+                                    results.append({
+                                        "timestamp": rec["T"],
+                                        "topic": t,
+                                        "value": rec["V"]
+                                    })
+                            else:
+                                disk_data = load_disk(t)
+                                flt = filter_data_by_time(disk_data, sdt, edt)
+                                for rec in flt:
+                                    results.append({
+                                        "timestamp": rec["T"],
+                                        "topic": t,
+                                        "value": rec["V"]
+                                    })
 
-                            filtered_data = filter_data_by_time(data_list, start_dt, end_dt)
-                            for entry in filtered_data:
-                                all_entries.append({
-                                    "timestamp": entry["T"],
-                                    "topic": t,
-                                    "value": entry["V"]
-                                })
-
-                    await websocket.send(json.dumps(all_entries))
+                    await websocket.send(json.dumps(results))
 
                 else:
                     await websocket.send(json.dumps({"error": "Unknown action"}))
 
             except Exception:
-                log.exception("Unhandled exception in handle_request (inner)")
+                log.exception("Error in handle_request (inner)")
                 await websocket.send(json.dumps({"error": "Internal error"}))
 
     except ws_exceptions.ConnectionClosedError as e:
         log.warning(f"WebSocket connection closed: {e}")
     except Exception:
-        log.exception("Unhandled exception in handle_request (outer)")
+        log.exception("Error in handle_request (outer)")
+
+# ---------------------------------------------------------------------------
+# ASYNC TASKS
+# ---------------------------------------------------------------------------
 
 async def run_mqtt(client):
     """
-    Runs the paho-mqtt client loop in a separate thread, so it doesn't block
-    the main asyncio event loop.
+    Runs paho-mqtt loop in a separate thread, preventing blocking.
     """
     try:
         await asyncio.to_thread(client.loop_forever)
@@ -439,145 +516,142 @@ async def run_mqtt(client):
         log.exception("Unhandled exception in run_mqtt")
 
 async def start_websocket_server(port):
-    """
-    Creates and starts the WebSocket server on the specified port,
-    listening for JSON-based requests (handle_request).
-    """
     try:
-        log.info("Starting WebSocket server...")
-        server = await serve(
-            handle_request,
-            "0.0.0.0",
-            port,
-            ping_interval=30,
-            ping_timeout=10
-        )
-        log.info(f"WebSocket server is running on ws://0.0.0.0:{port}")
+        log.info(f"Starting WebSocket server on port {port}...")
+        server = await serve(handle_request, "0.0.0.0", port, ping_interval=30, ping_timeout=10)
+        log.info(f"WebSocket server running at ws://0.0.0.0:{port}")
         await server.wait_closed()
     except Exception:
         log.exception("Unhandled exception in start_websocket_server")
 
 async def rest_health(request):
     """
-    AIOHTTP handler for GET /health.
-    Similar to the WebSocket 'health' action, returns system and topics info
-    if the 'passkey' is valid, or 403 if invalid.
+    GET /health => system info, memory usage, etc. passkey needed.
     """
     passkey = request.query.get("passkey", "")
     if not passkey_valid(passkey):
         return web.json_response({"error": "Invalid passkey"}, status=403)
 
     file_dir = os.path.dirname(os.path.abspath(__file__)) or '.'
-    disk_usage = psutil.disk_usage(file_dir)
+    disk_use = psutil.disk_usage(file_dir)
     mem = psutil.virtual_memory()
 
     now_utc = datetime.now(timezone.utc)
-    with userdata_lock:
-        uptime_seconds = (now_utc - start_time_utc).total_seconds()
-        topics_copy = request.app["userdata"].get("topics", [])
-        settings_copy = request.app["userdata"].get("topic_settings", {})
+    with request.app["userdata_lock"]:
+        uptime_sec = (now_utc - start_time_utc).total_seconds()
+        all_topics = request.app["userdata"]["topics"]
+        t_sett = request.app["userdata"]["topic_settings"]
 
-    days, remainder = divmod(uptime_seconds, 86400)
+        sum_mem_cache = 0
+        for tp in all_topics:
+            if t_sett[tp].get("enable_in_memory_cache", False):
+                mem_list = request.app["userdata"]["in_memory_data"].get(tp, [])
+                sum_mem_cache += sys_deep_size(mem_list)
+
+    days, remainder = divmod(uptime_sec, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes, seconds = divmod(remainder, 60)
-    uptime_formatted = f"{int(days)}d, {int(hours):02}:{int(minutes):02}:{int(seconds):02}"
+    up_str = f"{int(days)}d, {int(hours):02}:{int(minutes):02}:{int(seconds):02}"
 
-    config = load_config("config.json") or {}
-    files_size_sum = 0
-    for t in config.get("topics", []):
-        topic_file = get_topic_file_name(t)
-        if os.path.exists(topic_file):
-            files_size_sum += os.path.getsize(topic_file)
+    cfg = load_config("config.json") or {}
+    disk_sum = 0
+    for o in cfg.get("topics", []):
+        tf = get_topic_file_name(o["topic"])
+        if os.path.exists(tf):
+            disk_sum += os.path.getsize(tf)
 
-    topics_info = get_topic_info(topics_copy, settings_copy)
-    current_ts = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    t_info = get_topic_info(all_topics, t_sett)
+    now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    info = {
+    resp = {
         "status": "ok",
         "version": VERSION,
-        "timestamp": current_ts,
+        "timestamp": now_str,
         "mem_total_mb": round(mem.total / (1024 * 1024), 2),
         "mem_used_mb": round(mem.used / (1024 * 1024), 2),
         "mem_percent": mem.percent,
-        "disk_total_mb": round(disk_usage.total / (1024 * 1024), 2),
-        "disk_used_mb": round(disk_usage.used / (1024 * 1024), 2),
-        "disk_percent": disk_usage.percent,
-        "data_files_size_bytes": files_size_sum,
+        "disk_total_mb": round(disk_sum / (1024 * 1024), 2),
+        "disk_used_mb": round(disk_use.used / (1024 * 1024), 2),
+        "disk_percent": disk_use.percent,
+        "data_files_size_bytes": disk_sum,
         "packets_count": packets_count,
-        "uptime": uptime_formatted,
-        "topics_info": topics_info
+        "uptime": up_str,
+        "cache_mem_total_bytes": sum_mem_cache,
+        "topics_info": t_info
     }
-    return web.json_response(info)
+    return web.json_response(resp)
 
 async def rest_get_data(request):
     """
-    AIOHTTP handler for GET /data. It retrieves the data for the requested topic(s)
-    and optional time range (start_time / end_time), returning a JSON array of objects.
+    GET /data => passkey, optional start/end times. If caching => read from memory,
+    else from disk. We have the same approach as in handle_request (websocket).
     """
     passkey = request.query.get("passkey", "")
     if not passkey_valid(passkey):
         return web.json_response({"error": "Invalid passkey"}, status=403)
 
-    start_time_str = request.query.get("start_time", "")
-    end_time_str = request.query.get("end_time", "")
-    topic = request.query.get("topic", "")
+    st = request.query.get("start_time", "")
+    et = request.query.get("end_time", "")
+    tpc = request.query.get("topic", "")
 
-    config = load_config("config.json") or {}
+    cfg = load_config("config.json") or {}
 
-    # Convert time parameters (if provided) into datetime objects
     start_dt = None
     end_dt = None
+    if st:
+        start_dt = datetime.fromisoformat(st).astimezone(timezone.utc)
+    if et:
+        end_dt = datetime.fromisoformat(et).astimezone(timezone.utc)
 
-    if start_time_str:
-        start_dt = datetime.fromisoformat(start_time_str).astimezone(timezone.utc)
-    if end_time_str:
-        end_dt = datetime.fromisoformat(end_time_str).astimezone(timezone.utc)
+    req_tops = []
+    if tpc:
+        req_tops = [tpc]
+    else:
+        for obj in cfg.get("topics", []):
+            req_tops.append(obj["topic"])
 
-    requested_topics = [topic] if topic else config.get("topics", [])
-
-    # If both start_dt and end_dt exist but are reversed, return empty
-    if (start_dt is not None) and (end_dt is not None) and (start_dt > end_dt):
-        log.warning("start_time > end_time. Returning empty list.")
+    if start_dt and end_dt and start_dt > end_dt:
+        log.warning("start_time > end_time => returning empty list")
         return web.json_response([])
 
-    all_entries = []
-    with file_lock:
-        for t in requested_topics:
-            topic_file = get_topic_file_name(t)
-            if not os.path.exists(topic_file):
-                continue
-            try:
-                with open(topic_file, 'r') as f:
-                    data_list = json.load(f)
-            except (json.JSONDecodeError, FileNotFoundError):
-                data_list = []
+    results = []
+    with request.app["userdata_lock"]:
+        for top in req_tops:
+            stt = request.app["userdata"]["topic_settings"][top]
+            c_en = stt.get("enable_in_memory_cache", False)
+            if c_en:
+                mem_list = request.app["userdata"]["in_memory_data"].get(top, [])
+                filtered = filter_data_by_time(mem_list, start_dt, end_dt)
+                for rec in filtered:
+                    results.append({
+                        "timestamp": rec["T"],
+                        "topic": top,
+                        "value": rec["V"]
+                    })
+            else:
+                disk_data = load_disk(top)
+                filtered = filter_data_by_time(disk_data, start_dt, end_dt)
+                for rec in filtered:
+                    results.append({
+                        "timestamp": rec["T"],
+                        "topic": top,
+                        "value": rec["V"]
+                    })
 
-            filtered_data = filter_data_by_time(data_list, start_dt, end_dt)
-            for entry in filtered_data:
-                all_entries.append({
-                    "timestamp": entry["T"],
-                    "topic": t,
-                    "value": entry["V"]
-                })
-
-    return web.json_response(all_entries)
+    return web.json_response(results)
 
 async def start_rest_server(port, userdata):
     """
-    Sets up the REST server (AIOHTTP) on the specified port, exposing:
-      - GET /health
-      - GET /data
-    Each requires a 'passkey' query param. If valid, returns requested data.
+    Starts AIOHTTP server on 0.0.0.0:<port>, mapping /health -> rest_health and
+    /data -> rest_get_data.
     """
     try:
         log.info("Starting REST server...")
         app = web.Application()
-        # Attach references to locks and user data so the request handlers can use them
         app["file_lock"] = file_lock
         app["userdata_lock"] = userdata_lock
         app["userdata"] = userdata
 
-        # Add routes for health and data
         app.router.add_get("/health", rest_health)
         app.router.add_get("/data", rest_get_data)
 
@@ -587,7 +661,6 @@ async def start_rest_server(port, userdata):
         await site.start()
 
         log.info(f"REST server is running on http://0.0.0.0:{port}")
-        # Keep the REST server alive indefinitely
         while True:
             await asyncio.sleep(3600)
     except Exception:
@@ -596,136 +669,122 @@ async def start_rest_server(port, userdata):
 async def main():
     """
     Main async entry point:
-      1. Loads config
-      2. Connects to MQTT
-      3. Launches optional WebSocket/REST servers
-      4. Starts the downsampling checker
+      1) Load config
+      2) For each topic => load existing data from disk as downsampled history
+         if caching => store entire list in memory
+         if not caching => we ignore in_memory_data
+      3) Initialize last_saved_time
+      4) connect to MQTT
+      5) launch optional WebSocket & REST
+      6) run sampling_intervals in check_intervals
     """
-    config = load_config("config.json")
-    if not config:
+    cfg = load_config("config.json")
+    if not cfg:
         return
 
-    broker = config.get("broker")
-    port = config.get("port", 1883)
-    username = config.get("username")
-    password = config.get("password")
-    topics = config.get("topics", [])
+    broker = cfg.get("broker")
+    port = cfg.get("port", 1883)
+    username = cfg.get("username")
+    password = cfg.get("password")
 
-    sampling_intervals = config.get("sampling_interval", [])
-    retention_days_list = config.get("retention_days", [])
-    websocket_port = config.get("websocket_port", 8080)
-    api_rest_port = config.get("API_Rest_port", 0)
+    topics_conf = cfg.get("topics", [])
+    ws_port = cfg.get("websocket_port", 8080)
+    rest_port = cfg.get("API_Rest_port", 0)
 
-    # If sampling_intervals or retention_days_list are not lists, replicate them for each topic
-    if not isinstance(sampling_intervals, list):
-        sampling_intervals = [sampling_intervals] * len(topics)
-    if not isinstance(retention_days_list, list):
-        retention_days_list = [retention_days_list] * len(topics)
-
-    # Basic consistency checks
-    if len(sampling_intervals) != len(topics):
-        log.error("The number of 'sampling_intervals' must match the number of topics.")
-        return
-    if len(retention_days_list) != len(topics):
-        log.error("The number of 'retention_days' must match the number of topics.")
-        return
-    if not broker or not topics:
-        log.error("Broker and topics must be specified in the config file.")
+    if not broker or not topics_conf:
+        log.error("Broker and topics must be specified in config.json.")
         return
 
-    # Append a random suffix to client_id to avoid collisions
-    client_id = f"{config.get('client_id', 'mqtt_client')}-{randint(100000, 999999)}"
-    log.info(f"Client ID: {client_id}")
-
-    # Prepare dictionaries to track last_values, last_saved_time, and topic_settings
-    last_values = {}
-    last_saved_time = {}
+    topics = []
     topic_settings = {}
+    in_memory_data = {}
+    last_values = {}  # for non-cached topics
+    latest_cache_value = {}  # for cached topics with si>0
+    last_saved_time = {}
 
     now = datetime.now(timezone.utc)
-    for i, t in enumerate(topics):
-        last_values[t] = "--"
+    for obj in topics_conf:
+        t = obj["topic"]
+        si = obj["sampling_interval"]
+        rd = obj["retention_days"]
+        c_en = obj.get("enable_in_memory_cache", False)
+
+        topics.append(t)
         topic_settings[t] = {
-            "sampling_interval": sampling_intervals[i],
-            "retention_days": retention_days_list[i]
+            "sampling_interval": si,
+            "retention_days": rd,
+            "enable_in_memory_cache": c_en
         }
+        last_values[t] = None
+        latest_cache_value[t] = None
 
-        topic_file = get_topic_file_name(t)
-        try:
-            with open(topic_file, 'r') as f:
-                try:
-                    file_data = json.load(f)
-                except json.JSONDecodeError:
-                    file_data = []
-        except FileNotFoundError:
-            file_data = []
+        # load existing data from disk
+        disk_data = load_disk(t)
+        disk_data = apply_retention(disk_data, rd)
+        disk_data.sort(key=lambda x: x["T"])
 
-        if file_data:
-            # Sort the data to find the last saved entry time
-            file_data.sort(key=lambda x: x["T"])
-            last_entry_time = datetime.fromisoformat(file_data[-1]["T"]).astimezone(timezone.utc)
-            delta = (now - last_entry_time).total_seconds()
-            si = topic_settings[t]["sampling_interval"]
-
-            # If the last sample is older than the interval, we schedule the next save immediately
-            if si != 0:
+        if disk_data:
+            last_ts = disk_data[-1]["T"]
+            last_dt = datetime.fromisoformat(last_ts).astimezone(timezone.utc)
+            delta = (now - last_dt).total_seconds()
+            if si > 0:
                 if delta >= si:
                     adj_time = now - timedelta(seconds=si)
                     last_saved_time[t] = adj_time
-                    log.info(f"[Init] Topic '{t}': last sample older than interval. Will save next data immediately.")
                 else:
-                    last_saved_time[t] = last_entry_time
-                    log.info(f"[Init] Topic '{t}': continuing from last saved time {last_entry_time}.")
+                    last_saved_time[t] = last_dt
             else:
-                last_saved_time[t] = last_entry_time
-                log.info(f"[Init] Topic '{t}': sampling_interval=0, immediate save mode.")
+                last_saved_time[t] = last_dt
         else:
             last_saved_time[t] = now
-            log.info(f"[Init] Topic '{t}': no previous data. Starting now.")
 
-    # Create MQTT client and attach callbacks
+        if c_en:
+            # store entire disk data in memory
+            in_memory_data[t] = disk_data
+        else:
+            in_memory_data[t] = []  # we won't use it for queries
+
+        log.info(f"[Init] topic='{t}' loaded {len(disk_data)} records from disk, caching={c_en}, si={si}")
+
+    client_id = f"{cfg.get('client_id','mqtt_client')}-{randint(100000,999999)}"
+    log.info(f"Client ID: {client_id}")
+
     client = mqtt.Client(client_id=client_id, transport="tcp")
     client.enable_logger(log)
 
+    global GLOBAL_USERDATA
     userdata_dict = {
         "topics": topics,
         "topic_settings": topic_settings,
+        "in_memory_data": in_memory_data,
         "last_values": last_values,
+        "latest_cache_value": latest_cache_value,
         "last_saved_time": last_saved_time
     }
-    client.user_data_set(userdata_dict)
-
-    global GLOBAL_USERDATA
     GLOBAL_USERDATA = userdata_dict
 
+    client.user_data_set(userdata_dict)
     client.on_connect = on_connect
     client.on_message = on_message
 
-    # Set MQTT username & password if provided
     if username and password:
         client.username_pw_set(username, password)
 
-    # Attempt to connect to the broker
     try:
         client.connect(broker, port, 60)
     except Exception:
         log.exception("Could not connect to broker.")
         return
 
-    # Start the main tasks asynchronously
     tasks = []
-    tasks.append(run_mqtt(client))              # MQTT loop
-    tasks.append(check_intervals(userdata_dict))# Periodic saving loop
+    tasks.append(run_mqtt(client))
+    tasks.append(check_intervals(userdata_dict))
 
-    # Launch WebSocket server if websocket_port != 0
-    if websocket_port != 0:
-        tasks.append(start_websocket_server(websocket_port))
+    if ws_port != 0:
+        tasks.append(start_websocket_server(ws_port))
+    if rest_port != 0:
+        tasks.append(start_rest_server(rest_port, userdata_dict))
 
-    # Launch REST server if api_rest_port != 0
-    if api_rest_port != 0:
-        tasks.append(start_rest_server(api_rest_port, userdata_dict))
-
-    # Run all tasks concurrently
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
