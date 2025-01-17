@@ -81,6 +81,7 @@ The application reads settings from `config.json`. Below is an **example**:
 
 
 > [!NOTE] Important
+>
 > When "enable_in_memory_cache" = True, the data file is cached in memory. The program has no mechanism to control the size of memory used. The user must select appropriate "sampling_interval" and "retention_days" values to ensure that memory usage does not exceed available memory.
 
 ---
