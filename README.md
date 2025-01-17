@@ -1,6 +1,6 @@
-# SaveMqttData — Version 0.9.6
+# SaveMqttData — Version 0.9.7
 
-This document describes how to configure, run, and use **SaveMqttData**, a Python program that collects MQTT data, stores it in per-topic JSON files, and provides both a **WebSocket** and a **REST** server for data queries. It includes data retention, downsampling (periodic saving), in-memory caching, Argon2-based passkey protection, and more.
+This manual describes how to configure, run, and use **SaveMqttData**, a Python program that collects MQTT data, stores it in per-topic JSON files, and provides both a **WebSocket** and a **REST** server for data queries. It includes data retention, downsampling (periodic saving), in-memory caching, GZip compression for responses, Argon2-based passkey protection, and more.
 
 ---
 
@@ -52,7 +52,7 @@ The application reads settings from `config.json`. Below is an **example**:
             "enable_in_memory_cache": false
         }
     ],
-    "websocket_port": 8081,
+    "websocket_port": 9001,
     "API_Rest_port": 8080,
     "passkeyHash": "$argon2id$v=19$m=65536,t=3,p=4$examplehash"
 }
@@ -60,21 +60,28 @@ The application reads settings from `config.json`. Below is an **example**:
 
 ### Explanation of Fields
 
-- **`broker`, `port`**: MQTT broker address and port.
-- **`username`, `password`**: MQTT credentials (optional).
+- **`broker`**, **`port`**: MQTT broker address and port.
+    
+- **`username`**, **`password`**: MQTT credentials (optional).
+    
 - **`client_id`**: Base name for the MQTT client ID (random suffix is appended).
+    
 - **`topics`**: List of MQTT topics to subscribe, with individual configurations:
+    
     - **`sampling_interval`**: Interval (in seconds) for saving messages:
         - `0`: Messages saved immediately.
         - `>0`: Messages buffered and saved periodically.
     - **`retention_days`**: Retention duration (in days) for saved messages.
     - **`enable_in_memory_cache`**: Boolean to enable caching of the entire data file in memory for improved performance.
 - **`websocket_port`**: Port for the WebSocket server (set `0` to disable WebSocket).
+    
 - **`API_Rest_port`**: Port for the REST server (set `0` to disable REST server).
+    
 - **`passkeyHash`**: Argon2 hash of your passkey, used to validate client connections.
 
+
 > [!NOTE] Important
-When "enable_in_memory_cache" = True, the data file is cached in memory. The program has no mechanism to control the size of memory used. The user must select appropriate "sampling_interval" and "retention_days" values to ensure that memory usage does not exceed available memory.
+> When "enable_in_memory_cache" = True, the data file is cached in memory. The program has no mechanism to control the size of memory used. The user must select appropriate "sampling_interval" and "retention_days" values to ensure that memory usage does not exceed available memory.
 
 ---
 
@@ -123,7 +130,7 @@ Inside each file, new records are appended as:
 
 Whenever new data is saved:
 
-1. The program reads the existing JSON file (if not cached).
+1. The program reads the existing JSON file.
 2. Removes records older than `retention_days`.
 3. Writes back the updated JSON file.
 
@@ -134,7 +141,7 @@ Whenever new data is saved:
 - **`on_connect`**: Subscribes to the listed topics on successful broker connection.
 - **`on_message`**:
     - Decodes each message payload.
-    - Checks the topic’s `sampling_interval`.
+    - Checks the topic’s `sampling_interval` and `enable_in_memory_cache`.
     - If caching is enabled, keeps the entire file in memory for improved performance.
     - A background loop (`check_intervals`) periodically saves buffered data to disk.
 
@@ -166,7 +173,7 @@ ws://<HOST>:<websocket_port>
 ```json
 {
     "status": "ok",
-    "version": "0.9.3",
+    "version": "0.9.7",
     "timestamp": "2025-01-15T12:00:00Z",
     "mem_total_mb": 2048.0,
     "mem_used_mb": 512.0,
@@ -203,9 +210,12 @@ ws://<HOST>:<websocket_port>
     "passkey": "<your_password>",
     "topic": "/devices/temperature",
     "start_time": "2025-01-01T00:00:00Z",
-    "end_time": "2025-01-10T23:59:59Z"
+    "end_time": "2025-01-10T23:59:59Z",
+    "compress_data": true
 }
 ```
+
+If `compress_data` is `true`, the server GZips the JSON response and sends it as a binary frame. This parameter is optional and can be suppressed.
 
 ---
 
@@ -234,8 +244,16 @@ Returns the same JSON structure as the WebSocket `health` action.
 Example:
 
 ```
-http://<HOST>:8080/data?passkey=<your_password>&topic=/devices/temperature&start_time=2025-01-01T00:00:00Z&end_time=2025-01-10T23:59:59Z
+http://<HOST>:8080/data?passkey=<your_password>&topic=/devices/temperature&start_time=2025-01-01T00:00:00Z&end_time=2025-01-10T23:59:59Z&compress_data=true
 ```
+
+If `compress_data=true`, the server returns a GZipped body with the headers:
+
+- **`Content-Encoding: gzip`**
+    
+- **`Content-Type: application/json`**
+    
+This parameter is optional and can be suppressed.
 
 ---
 
@@ -273,6 +291,7 @@ SaveMqttData offers:
 - MQTT data collection
 - Downsampling per topic, with immediate or periodic saving
 - In-memory caching of the entire data file for efficient resource usage
+- GZip compression for data responses to reduce bandwidth usage
 - Data retention to keep file sizes manageable
 - Two optional servers for queries: WebSocket and REST
 - Argon2 passkey-based security

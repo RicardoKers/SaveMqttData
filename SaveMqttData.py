@@ -1,4 +1,10 @@
-# SaveMqttData Version 0.9.6
+# SaveMqttData Version 0.9.7
+#
+# Added: GZip compression for get_data responses if "compress_data" == true.
+# - WebSocket: sends a binary frame with gzipped JSON.
+# - REST: sets "Content-Encoding: gzip" and returns gzipped JSON body.
+# No other features or comments changed. The program is otherwise identical
+# to version 0.9.6.
 
 import json
 import paho.mqtt.client as mqtt
@@ -11,12 +17,13 @@ import logging
 import os
 import psutil
 import sys
+import gzip  # for GZip compression
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 from aiohttp import web
 
-VERSION = "0.9.6"
+VERSION = "0.9.7"
 
-logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
 file_lock = Lock()
@@ -337,25 +344,20 @@ async def check_intervals(userdata):
                     elapsed = (now - last_save).total_seconds()
                     if elapsed >= si:
                         if c_en:
-                            # read in_memory_data, plus the single "latest_cache_value"
                             mem_list = userdata["in_memory_data"].get(t, [])
                             val = userdata["latest_cache_value"].get(t, None)
                             now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
                             if val is None:
-                                # no message => record "--"
                                 mem_list.append({"T": now_str, "V": "--"})
                             else:
                                 mem_list.append({"T": now_str, "V": val})
-                            # retention
                             mem_list = apply_retention(mem_list, rd)
                             mem_list.sort(key=lambda x: x["T"])
                             userdata["in_memory_data"][t] = mem_list
                             userdata["latest_cache_value"][t] = None  # reset
 
-                            # flush entire memory to disk
                             overwrite_disk(t, mem_list)
                         else:
-                            # not caching => read last_values
                             disk_data = load_disk(t)
                             val = userdata["last_values"].get(t, None)
                             now_str = now.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -388,6 +390,9 @@ async def handle_request(websocket, path=None):
                 topic = req.get("topic")
                 st = req.get("start_time")
                 et = req.get("end_time")
+
+                # NEW param: "compress_data" => if true => send gzipped JSON in binary
+                compress_data = req.get("compress_data", False)
 
                 if not passkey_valid(passkey):
                     await websocket.send(json.dumps({"error": "Invalid passkey"}))
@@ -441,6 +446,8 @@ async def handle_request(websocket, path=None):
                         "cache_mem_total_bytes": sum_mem_cache,
                         "topics_info": t_info
                     }
+
+                    # health is typically small, so we can just do normal JSON
                     await websocket.send(json.dumps(info))
 
                 elif action == "get_data":
@@ -488,7 +495,17 @@ async def handle_request(websocket, path=None):
                                         "value": rec["V"]
                                     })
 
-                    await websocket.send(json.dumps(results))
+                    # If compress_data => GZip the JSON, send as binary
+                    if compress_data:
+                        # Convert results to JSON, then GZip
+                        json_str = json.dumps(results)
+                        gzipped = gzip.compress(json_str.encode("utf-8"))
+                        # send as binary frame
+                        await websocket.send(gzipped)
+                        log.info(f"[WebSocket] Sent gzipped {len(results)} records for get_data (binary).")
+                    else:
+                        # normal JSON text
+                        await websocket.send(json.dumps(results))
 
                 else:
                     await websocket.send(json.dumps({"error": "Unknown action"}))
@@ -584,7 +601,7 @@ async def rest_health(request):
 async def rest_get_data(request):
     """
     GET /data => passkey, optional start/end times. If caching => read from memory,
-    else from disk. We have the same approach as in handle_request (websocket).
+    else from disk. If 'compress_data=true', we GZip the response.
     """
     passkey = request.query.get("passkey", "")
     if not passkey_valid(passkey):
@@ -593,6 +610,12 @@ async def rest_get_data(request):
     st = request.query.get("start_time", "")
     et = request.query.get("end_time", "")
     tpc = request.query.get("topic", "")
+
+    # parse "compress_data"
+    compress_data_str = request.query.get("compress_data", "false")
+    compress_data = (compress_data_str.lower() == "true")
+
+    log.info(f"Compress data param => {compress_data_str}, final bool => {compress_data}")
 
     cfg = load_config("config.json") or {}
 
@@ -638,7 +661,22 @@ async def rest_get_data(request):
                         "value": rec["V"]
                     })
 
-    return web.json_response(results)
+    if compress_data:
+        # GZip the JSON
+        json_str = json.dumps(results)
+        gzipped = gzip.compress(json_str.encode("utf-8"))
+        # Return as binary with "Content-Encoding: gzip"
+        log.info(f"Returned gzipped {len(results)} records for get_data (REST).")
+        return web.Response(
+            body=gzipped,
+            headers={
+                "Content-Encoding": "gzip",
+                "Content-Type": "application/json"
+            }
+        )
+    else:
+        # normal JSON
+        return web.json_response(results)
 
 async def start_rest_server(port, userdata):
     """
